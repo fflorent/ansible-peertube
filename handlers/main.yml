@@ -1,0 +1,9 @@
+---
+
+- name: install peertube daemon
+  systemd:
+    name: peertube
+    daemon_reload: yes
+    enabled: yes
+    state: started
+

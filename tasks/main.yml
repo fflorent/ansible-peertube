@@ -1,0 +1,212 @@
+---
+# TODO:
+#  - use include_tasks to group them
+- name: Install dependencies
+  apt: pkg={{item}} state=latest
+  with_items:
+    - curl
+    - sudo
+    - unzip
+    - vim
+    - nginx
+    - ffmpeg
+    - postgresql
+    - openssl
+    - g++
+    - make
+    - redis-server
+    - git
+    - python-psycopg2
+    - build-essential # for bcrypt?
+
+- name: Download NodeJS Helper
+  get_url:
+    url: https://deb.nodesource.com/setup_8.x
+    dest: /tmp/setup_node.sh
+    mode: 0755
+  register: node_helper_dl
+
+- name: Run NodeJS Helper
+  shell: /tmp/setup_node.sh
+  when: node_helper_dl is changed
+
+- name: Install NodeJS
+  apt: pkg=nodejs state=latest
+
+- name: Install Yarn apt key
+  apt_key:
+    url: https://dl.yarnpkg.com/debian/pubkey.gpg
+    state: present
+
+- name: Add Yarn apt repo
+  apt_repository:
+    repo: deb https://dl.yarnpkg.com/debian/ stable main
+    state: present
+
+- name: Install Yarn
+  apt: pkg=yarn state=latest
+
+- name: Add peertube user
+  user:
+    name: peertube
+    home: /var/www/peertube
+    shell: /bin/bash
+    password: "{{ peertube_user_password_hashed }}"
+
+- name: Add peertube user in Postgres
+  become: yes
+  become_user: postgres
+  postgresql_user:
+    name: peertube
+    password: "{{ peertube_dbuser_password }}"
+
+- name: Add Postgres database
+  become: yes
+  become_user: postgres
+  postgresql_db:
+    name: peertube_prod
+    owner: peertube
+
+- name: Create required directories
+  file:
+    path: /var/www/peertube/{{ item }}
+    state: directory
+    owner: peertube
+    group: peertube
+    mode: 0755
+  with_items:
+    - config
+    - storage
+    - versions
+
+- stat: path=/var/www/peertube/versions/peertube-{{ peertube_version }}
+  register: peertube_version_dir
+
+- name: Download and extract Peertube
+  unarchive:
+    src: "https://github.com/Chocobozzz/PeerTube/releases/download/{{ peertube_version }}/peertube-{{ peertube_version }}.zip"
+    dest: /var/www/peertube/versions
+    remote_src: yes
+    owner: peertube
+    group: peertube
+  when: peertube_version_dir.stat.exists == False
+  register: fresh_install
+
+- name: Create symlink peertube-latest
+  file:
+    src: "/var/www/peertube/versions/peertube-{{ peertube_version }}"
+    dest: /var/www/peertube/peertube-latest
+    state: link
+    owner: peertube
+    group: peertube
+
+- name: Change owner of all peertube directories # seems setting owner on unarchive is not enough…
+  file:
+    path: /var/www/peertube
+    owner: peertube
+    group: peertube
+    recurse: yes
+
+- name: Yarn install
+  become: true
+  become_user: peertube
+  shell: |
+    cd /var/www/peertube/peertube-latest
+    yarn install --production --pure-lockfile
+  when: fresh_install is changed
+
+- name: Copy production.yaml
+  copy:
+    src: files/production.yaml
+    dest: /var/www/peertube/config/production.yaml
+    owner: peertube
+    group: peertube
+    mode: 0644
+
+- name: Copy nginx conf file
+  template:
+    src: "nginx-peertube"
+    dest: /etc/nginx/sites-available/peertube
+    mode: 0644
+
+- name: Enable nginx conf file
+  file:
+    src: /etc/nginx/sites-available/peertube
+    dest: /etc/nginx/sites-enabled/peertube
+    state: link
+
+- name: Install Stretch backports repo
+  apt_repository:
+    repo: deb http://ftp.debian.org/debian stretch-backports main
+    state: present
+  when:
+    - (ansible_distribution_major_version == "9")
+  register: backports_installed
+
+- name: Change apt_preference
+  copy:
+    content: 'APT::Default-Release "stable";'
+    dest: /etc/apt/apt.conf.d/99apt_default
+    mode: 644
+  when: backports_installed is changed
+
+- name: Install certbot
+  apt:
+    pkg: python-certbot-nginx
+    state: latest
+    default_release: stretch-backports
+  register: certbot_installed
+
+- name: Install Letsencrypt certificate
+  shell: |
+    certbot certonly -n \
+      --authenticator standalone \
+      --installer nginx \
+      -d {{ peertube_tld }} \
+      -m {{ admin_email }} \
+      --agree-tos \
+      --pre-hook "systemctl stop nginx" \
+      --post-hook "systemctl start nginx"
+  when: certbot_installed is changed
+
+- name: Insert Let's encrypt certificates in nginx
+  blockinfile:
+    dest: /etc/nginx/sites-available/peertube
+    marker: "  # {mark} let's encrypt configuration"
+    block: |2-
+        ssl_certificate /etc/letsencrypt/live/{{ peertube_tld }}/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/{{ peertube_tld }}/privkey.pem;
+
+    insertbefore: ".*# Security hardening.*"
+    state: present
+
+- name: Reload nginx
+  service: name=nginx state=reloaded
+
+- name: Install Peertube daemon
+  copy:
+    src: "{{ role_path }}/files/peertube.service"
+    dest: /etc/systemd/system/
+  notify:
+    - install peertube daemon
+
+- name: Add tools in $PATH
+  become: true
+  become_user: peertube
+  lineinfile:
+    path: /var/www/peertube/.bashrc
+    state: present
+    line: 'export PATH="$PATH:/var/www/peertube/peertube-latest/dist/server/tools/"'
+
+- name: Change admin password
+  become: true
+  become_user: peertube
+  shell: |-1
+    cd /var/www/peertube/peertube-latest
+    yarn add commander
+    # FIXME escape characters
+    echo "{{ web_admin_password }}" | NODE_CONFIG_DIR=/var/www/peertube/config NODE_ENV=production npm run reset-password -- -u root
+  when:
+  - fresh_install # is changed
+  - web_admin_password is defined
+
